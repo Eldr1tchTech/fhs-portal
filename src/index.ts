@@ -1,36 +1,58 @@
 import { Hono } from 'hono'
-import { readFile } from 'fs/promises'
+import { db } from '@/db/db.js'
+import { users, magicLinkTokens } from '@/db/schema.js'
+import { eq } from 'drizzle-orm'
+import { randomBytes } from 'crypto'
 
 const app = new Hono()
 
-app.get('/', async (c) => {
-  const html = await readFile('./public/index.html', 'utf8')
-  return c.html(html)
-})
-
 app.post('/signin', async (c) => {
-  const { email, password } = await c.req.parseBody()
+  const { email } = await c.req.parseBody()
+  if (typeof email !== 'string') return c.text('Invalid input', 400)
 
-  // TODO: Use zod instead...
-  // Ensure they're strings (parseBody can return File objects)
-  if (typeof email !== 'string' || typeof password !== 'string') {
-    return c.text('Invalid input', 400)
+  // Find or create user
+  let user = await db.query.users.findFirst({
+    where: eq(users.email, email)
+  })
+  if (!user) {
+    [user] = await db.insert(users).values({ email }).returning()
   }
 
-  // Email format check
-  const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
-  if (!emailValid) {
-    return c.text('Invalid email', 400)
-  }
+  // Generate token
+  const token = randomBytes(32).toString('hex')
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000) // 15 min
 
-  // Password requirements
-  if (password.length < 8) {
-    return c.text('Password must be at least 8 characters', 400)
-  }
+  await db.insert(magicLinkTokens).values({
+    userId: user.id,
+    token,
+    expiresAt,
+  })
 
-  // ... proceed to DB lookup
-  console.log("Proceeding to db lookup...")
-  return c.text('OK')
+  const link = `${process.env.BASE_URL}/auth/verify?token=${token}`
+  // TODO: send email with `link` (e.g. via Resend, Nodemailer)
+  console.log('Magic link:', link)
+
+  return c.text('Check your email!')
 })
 
-export default app
+app.get('/auth/verify', async (c) => {
+  const token = c.req.query('token')
+  if (!token) return c.text('Missing token', 400)
+
+  const record = await db.query.magicLinkTokens.findFirst({
+    where: eq(magicLinkTokens.token, token),
+    with: { user: true }
+  })
+
+  if (!record || record.used || record.expiresAt < new Date()) {
+    return c.text('Invalid or expired link', 400)
+  }
+
+  // Mark token as used
+  await db.update(magicLinkTokens)
+    .set({ used: true })
+    .where(eq(magicLinkTokens.token, token))
+
+  // TODO: set a session cookie (e.g. using hono/cookie + a sessions table)
+  return c.text(`Logged in as ${record.user.email}`)
+})
